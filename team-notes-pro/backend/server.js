@@ -1,51 +1,78 @@
 const express = require('express');
-const { randomUUID } = require('crypto');
 const path = require('path');
+const { createPool } = require('./db');
 
 const app = express();
 app.use(express.json());
 
-// In-memory store — replaced by RDS in Stage 2
-const notes = [];
+let pool;
+
+// Maps pg snake_case columns → camelCase API response
+function toNote(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    content: row.content,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+  };
+}
+
+// Wraps async route handlers and returns 500 on unhandled rejection
+const wrap = (fn) => (req, res) =>
+  fn(req, res).catch((err) => {
+    console.error(err);
+    res.status(500).json({ error: 'internal server error' });
+  });
 
 // --- Health ---
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
-});
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 // --- Notes API ---
-app.get('/api/notes', (_req, res) => {
-  res.json(notes);
-});
+app.get('/api/notes', wrap(async (_req, res) => {
+  const { rows } = await pool.query('SELECT * FROM notes ORDER BY created_at DESC');
+  res.json(rows.map(toNote));
+}));
 
-app.post('/api/notes', (req, res) => {
+app.post('/api/notes', wrap(async (req, res) => {
   const { title, content, createdBy } = req.body;
   if (!title?.trim() || !content?.trim()) {
     return res.status(400).json({ error: 'title and content are required' });
   }
-  const note = {
-    id: randomUUID(),
-    title: title.trim(),
-    content: content.trim(),
-    createdBy: createdBy?.trim() || 'Anonymous',
-    createdAt: new Date().toISOString(),
-  };
-  notes.unshift(note);
-  res.status(201).json(note);
-});
+  const { rows } = await pool.query(
+    'INSERT INTO notes (title, content, created_by) VALUES ($1, $2, $3) RETURNING *',
+    [title.trim(), content.trim(), createdBy?.trim() || 'Anonymous']
+  );
+  res.status(201).json(toNote(rows[0]));
+}));
 
-app.delete('/api/notes/:id', (req, res) => {
-  const index = notes.findIndex((n) => n.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: 'note not found' });
-  notes.splice(index, 1);
+app.delete('/api/notes/:id', wrap(async (req, res) => {
+  const { rowCount } = await pool.query('DELETE FROM notes WHERE id = $1', [req.params.id]);
+  if (rowCount === 0) return res.status(404).json({ error: 'note not found' });
   res.status(204).send();
-});
+}));
 
 // Serve React build in production
 app.use(express.static(path.join(__dirname, 'public')));
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+async function start() {
+  pool = await createPool();
+
+  // Bootstrap schema — safe to run on every startup
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+      title      TEXT        NOT NULL,
+      content    TEXT        NOT NULL,
+      created_by TEXT        NOT NULL DEFAULT 'Anonymous',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  console.log('Schema ready');
+
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
+
+start().catch((err) => { console.error(err); process.exit(1); });
