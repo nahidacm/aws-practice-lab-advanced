@@ -95,7 +95,7 @@ function CreateModal({ onCreated, onClose }) {
     e.preventDefault();
     if (!form.title.trim() || !form.content.trim()) return;
     setSaving(true);
-    const res = await fetch('/api/notes', {
+    const res = await fetch(`${API_BASE}/api/notes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(form),
@@ -195,13 +195,18 @@ function LoadingDots() {
 
 // ---- App ----
 
+// In production (S3 + CloudFront) the frontend and API live on different origins.
+// Set VITE_API_URL at build time to the ALB URL or custom API domain.
+// In local dev the Vite proxy forwards /api to localhost:3000, so API_BASE stays empty.
+const API_BASE = import.meta.env.VITE_API_URL ?? '';
+
 export default function App() {
   const [notes, setNotes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
 
   useEffect(() => {
-    fetch('/api/notes')
+    fetch(`${API_BASE}/api/notes`)
       .then((r) => r.json())
       .then((data) => { setNotes(data); setLoading(false); });
   }, []);
@@ -211,7 +216,7 @@ export default function App() {
   }
 
   async function handleDelete(id) {
-    await fetch(`/api/notes/${id}`, { method: 'DELETE' });
+    await fetch(`${API_BASE}/api/notes/${id}`, { method: 'DELETE' });
     setNotes((prev) => prev.filter((n) => n.id !== id));
   }
 

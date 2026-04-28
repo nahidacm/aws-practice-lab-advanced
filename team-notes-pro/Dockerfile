@@ -4,6 +4,10 @@ WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
+# Stage 3: pass the API origin at build time so the frontend bundle knows where
+# to send fetch requests. Empty string = Vite proxy handles it (local dev only).
+ARG VITE_API_URL=""
+ENV VITE_API_URL=$VITE_API_URL
 RUN npm run build
 
 # ── Stage 2: Install backend prod deps ───────────────────────────────────────

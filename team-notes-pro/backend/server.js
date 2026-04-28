@@ -1,8 +1,18 @@
 const express = require('express');
 const path = require('path');
+const cors = require('cors');
 const { createPool } = require('./db');
 
 const app = express();
+
+// Stage 3: allow the CloudFront-hosted frontend (different origin) to call this API.
+// Set CORS_ORIGIN to your CloudFront / custom domain in production.
+// Falls back to localhost:5173 for Vite dev server when running outside Docker.
+app.use(cors({
+  origin: process.env.CORS_ORIGIN?.split(',') ?? ['http://localhost:5173'],
+  methods: ['GET', 'POST', 'DELETE'],
+}));
+
 app.use(express.json());
 
 let pool;
@@ -52,7 +62,7 @@ app.delete('/api/notes/:id', wrap(async (req, res) => {
   res.status(204).send();
 }));
 
-// Serve React build in production
+// Serve React build for local dev only — in production CloudFront serves S3 directly.
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
