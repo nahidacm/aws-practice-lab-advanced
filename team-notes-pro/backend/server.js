@@ -6,6 +6,7 @@ const { SQSClient, SendMessageCommand }         = require('@aws-sdk/client-sqs')
 const { S3Client, GetObjectCommand }            = require('@aws-sdk/client-s3');
 const { getSignedUrl }                          = require('@aws-sdk/s3-request-presigner');
 const { createPool }                            = require('./db');
+const { createCache }                           = require('./cache');
 
 const app = express();
 
@@ -18,6 +19,9 @@ app.use(cors({
 app.use(express.json());
 
 let pool;
+let cache;
+
+const notesKey = (userId) => `notes:${userId}`;
 
 // --- AWS clients (Stage 5) ---
 
@@ -100,11 +104,17 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 // --- Notes API ---
 
 app.get('/api/notes', requireAuth, wrap(async (req, res) => {
+  const key    = notesKey(req.user.sub);
+  const cached = await cache.get(key);
+  if (cached) return res.json(cached);
+
   const { rows } = await pool.query(
     'SELECT * FROM notes WHERE user_id = $1 ORDER BY created_at DESC',
     [req.user.sub]
   );
-  res.json(rows.map(toNote));
+  const notes = rows.map(toNote);
+  await cache.set(key, notes); // TTL 60 s — see cache.js for invalidation strategy
+  res.json(notes);
 }));
 
 app.post('/api/notes', requireAuth, wrap(async (req, res) => {
@@ -116,6 +126,7 @@ app.post('/api/notes', requireAuth, wrap(async (req, res) => {
     'INSERT INTO notes (title, content, created_by, user_id) VALUES ($1, $2, $3, $4) RETURNING *',
     [title.trim(), content.trim(), req.user.email, req.user.sub]
   );
+  await cache.del(notesKey(req.user.sub)); // list changed — next GET rebuilds from DB
   res.status(201).json(toNote(rows[0]));
 }));
 
@@ -125,6 +136,7 @@ app.delete('/api/notes/:id', requireAuth, wrap(async (req, res) => {
     [req.params.id, req.user.sub]
   );
   if (rowCount === 0) return res.status(404).json({ error: 'note not found' });
+  await cache.del(notesKey(req.user.sub)); // list changed — next GET rebuilds from DB
   res.status(204).send();
 }));
 
@@ -185,7 +197,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 async function start() {
-  pool = await createPool();
+  pool  = await createPool();
+  cache = createCache();
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notes (

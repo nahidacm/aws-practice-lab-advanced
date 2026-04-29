@@ -8,6 +8,7 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@db:5432/teamnotes
       DEV_SKIP_AUTH: "true"
+      REDIS_URL: redis://redis:6379
       # Stage 5: leave these unset locally to disable the export feature,
       # or point to real AWS SQS/S3 with credentials mounted via ~/.aws
       # SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/<account>/team-notes-pro-exports
@@ -15,6 +16,8 @@ services:
       # AWS_REGION: us-east-1
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   worker:
@@ -49,6 +52,16 @@ services:
       retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   postgres_data:
