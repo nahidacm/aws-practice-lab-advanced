@@ -13,10 +13,11 @@ function Icon({ d, size = 16, ...props }) {
   );
 }
 
-const NoteIcon = () => <Icon size={14} d={<><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></>} stroke="white" strokeWidth="2.5" />;
-const PlusIcon  = () => <Icon size={15} d={<><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></>} strokeWidth="2.5" />;
-const TrashIcon = () => <Icon size={14} d={<><polyline points="3 6 5 6 21 6"/><path d="m19 6-.867 12.142A2 2 0 0 1 16.138 20H7.862a2 2 0 0 1-1.995-1.858L5 6m5 0V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v2"/></>} />;
-const CloseIcon = () => <Icon size={16} d={<><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>} strokeWidth="2.5" />;
+const NoteIcon   = () => <Icon size={14} d={<><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></>} stroke="white" strokeWidth="2.5" />;
+const PlusIcon   = () => <Icon size={15} d={<><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></>} strokeWidth="2.5" />;
+const TrashIcon  = () => <Icon size={14} d={<><polyline points="3 6 5 6 21 6"/><path d="m19 6-.867 12.142A2 2 0 0 1 16.138 20H7.862a2 2 0 0 1-1.995-1.858L5 6m5 0V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v2"/></>} />;
+const CloseIcon  = () => <Icon size={16} d={<><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>} strokeWidth="2.5" />;
+const ExportIcon = () => <Icon size={14} d={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></>} />;
 
 // ---- Helpers ----
 
@@ -32,7 +33,6 @@ function timeAgo(iso) {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-// Decode the email claim from an ID token without verifying (display only — backend verifies)
 function parseJwtEmail(token) {
   try { return JSON.parse(atob(token.split('.')[1])).email ?? ''; }
   catch { return ''; }
@@ -157,6 +157,58 @@ function CreateModal({ onCreated, onClose, authFetch }) {
   );
 }
 
+// ---- Export button + status ----
+// exportJob: null | { id, status, downloadUrl, error }
+
+function ExportControl({ exportJob, onExport, onDismiss }) {
+  if (!exportJob) {
+    return (
+      <button onClick={onExport}
+        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600
+          bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors">
+        <ExportIcon /> Export
+      </button>
+    );
+  }
+
+  if (exportJob.status === 'completed') {
+    return (
+      <div className="flex items-center gap-2">
+        <a href={exportJob.downloadUrl} target="_blank" rel="noreferrer"
+          className="flex items-center gap-1 text-xs font-medium text-emerald-700
+            bg-emerald-50 hover:bg-emerald-100 px-3 py-1.5 rounded-xl transition-colors">
+          <ExportIcon /> Download
+        </a>
+        <button onClick={onDismiss} title="Dismiss"
+          className="text-gray-300 hover:text-gray-500 transition-colors">
+          <CloseIcon />
+        </button>
+      </div>
+    );
+  }
+
+  if (exportJob.status === 'failed') {
+    return (
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-red-500 bg-red-50 px-3 py-1.5 rounded-xl">
+          Export failed
+        </span>
+        <button onClick={onDismiss} title="Dismiss"
+          className="text-gray-300 hover:text-gray-500 transition-colors">
+          <CloseIcon />
+        </button>
+      </div>
+    );
+  }
+
+  // queued or processing
+  return (
+    <span className="text-xs text-indigo-500 bg-indigo-50 px-3 py-1.5 rounded-xl animate-pulse">
+      {exportJob.status === 'processing' ? 'Processing…' : 'Queued…'}
+    </span>
+  );
+}
+
 // ---- Empty State ----
 
 function EmptyState({ onNew }) {
@@ -194,26 +246,21 @@ function LoadingDots() {
 
 // ---- App ----
 
-// In production (S3 + CloudFront) the frontend and API live on different origins.
-// Set VITE_API_URL at build time to the ALB URL or custom API domain.
-// In local dev the Vite proxy forwards /api to localhost:3000, so API_BASE stays empty.
 const API_BASE = import.meta.env.VITE_API_URL ?? '';
 
 export default function App() {
-  const [notes, setNotes]         = useState([]);
-  const [loading, setLoading]     = useState(true);
+  const [notes, setNotes]           = useState([]);
+  const [loading, setLoading]       = useState(true);
   const [showCreate, setShowCreate] = useState(false);
-  // null = checking session, '' = signed out, string = valid ID token
-  const [token, setToken]         = useState(null);
+  const [token, setToken]           = useState(null); // null=checking, ''=signed out, string=token
+  const [exportJob, setExportJob]   = useState(null); // null | { id, status, downloadUrl, error }
 
   const userEmail = token ? parseJwtEmail(token) : '';
 
-  // Check for an existing Cognito session once on mount
   useEffect(() => {
     getIdToken().then((tok) => setToken(tok ?? ''));
   }, []);
 
-  // Fetch wrapper — attaches Authorization header, handles expired sessions
   async function authFetch(url, options = {}) {
     const tok = await getIdToken();
     if (!tok) { setToken(''); return null; }
@@ -223,7 +270,6 @@ export default function App() {
     });
   }
 
-  // Load the user's notes whenever they sign in (token changes from '' to a real value)
   useEffect(() => {
     if (!token) return;
     setLoading(true);
@@ -232,6 +278,18 @@ export default function App() {
       .then((data) => { if (data) { setNotes(data); setLoading(false); } });
   }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Poll the export job every 2 s until it reaches a terminal state
+  useEffect(() => {
+    if (!exportJob || exportJob.status === 'completed' || exportJob.status === 'failed') return;
+    const timer = setInterval(async () => {
+      const res = await authFetch(`${API_BASE}/api/exports/${exportJob.id}`);
+      if (!res) return;
+      const job = await res.json();
+      setExportJob(job);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [exportJob?.id, exportJob?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
   function handleCreated(note) { setNotes((prev) => [note, ...prev]); }
 
   async function handleDelete(id) {
@@ -239,13 +297,21 @@ export default function App() {
     setNotes((prev) => prev.filter((n) => n.id !== id));
   }
 
+  async function handleExport() {
+    const res = await authFetch(`${API_BASE}/api/exports`, { method: 'POST' });
+    if (!res) return;
+    if (res.status === 503) { alert('Export is not available right now.'); return; }
+    const { jobId, status } = await res.json();
+    setExportJob({ id: jobId, status });
+  }
+
   function handleSignOut() {
     signOut();
     setToken('');
     setNotes([]);
+    setExportJob(null);
   }
 
-  // Checking existing session
   if (token === null) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
@@ -254,7 +320,6 @@ export default function App() {
     );
   }
 
-  // Not authenticated
   if (!token) {
     return <AuthScreen onSuccess={() => getIdToken().then((tok) => setToken(tok ?? ''))} />;
   }
@@ -266,7 +331,6 @@ export default function App() {
       <header className="bg-white border-b border-gray-100 sticky top-0 z-10">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
 
-          {/* Logo + name + count */}
           <div className="flex items-center gap-2.5">
             <div className="w-7 h-7 bg-indigo-600 rounded-lg flex items-center justify-center shrink-0">
               <NoteIcon />
@@ -279,8 +343,7 @@ export default function App() {
             )}
           </div>
 
-          {/* User info + actions */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
             <span className="hidden sm:block text-xs text-gray-400 truncate max-w-[160px]">
               {userEmail}
             </span>
@@ -288,6 +351,13 @@ export default function App() {
               className="text-xs text-gray-400 hover:text-gray-600 transition-colors px-2 py-1 rounded-lg hover:bg-gray-100">
               Sign out
             </button>
+
+            <ExportControl
+              exportJob={exportJob}
+              onExport={handleExport}
+              onDismiss={() => setExportJob(null)}
+            />
+
             <button
               onClick={() => setShowCreate(true)}
               className="flex items-center gap-1.5 px-3.5 py-2 bg-indigo-600 text-white text-sm font-medium
@@ -315,7 +385,6 @@ export default function App() {
         )}
       </main>
 
-      {/* ── Modal ── */}
       {showCreate && (
         <CreateModal
           onCreated={handleCreated}

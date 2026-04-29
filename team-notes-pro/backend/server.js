@@ -1,22 +1,31 @@
 const express = require('express');
-const path = require('path');
-const cors = require('cors');
-const { CognitoJwtVerifier } = require('aws-jwt-verify');
-const { createPool } = require('./db');
+const path    = require('path');
+const cors    = require('cors');
+const { CognitoJwtVerifier }                   = require('aws-jwt-verify');
+const { SQSClient, SendMessageCommand }         = require('@aws-sdk/client-sqs');
+const { S3Client, GetObjectCommand }            = require('@aws-sdk/client-s3');
+const { getSignedUrl }                          = require('@aws-sdk/s3-request-presigner');
+const { createPool }                            = require('./db');
 
 const app = express();
 
-// Stage 3: cross-origin requests from CloudFront.
-// Stage 4: Authorization header must be in allowedHeaders for CORS preflight.
 app.use(cors({
-  origin: process.env.CORS_ORIGIN?.split(',') ?? ['http://localhost:5173'],
-  methods: ['GET', 'POST', 'DELETE'],
+  origin:         process.env.CORS_ORIGIN?.split(',') ?? ['http://localhost:5173'],
+  methods:        ['GET', 'POST', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json());
 
 let pool;
+
+// --- AWS clients (Stage 5) ---
+
+const REGION = process.env.AWS_REGION || 'us-east-1';
+
+// Only initialised when env vars are present so the API still starts in dev without SQS/S3
+const sqs = process.env.SQS_QUEUE_URL  ? new SQSClient({ region: REGION }) : null;
+const s3  = process.env.EXPORT_BUCKET  ? new S3Client({ region: REGION })  : null;
 
 // --- JWT verification (Stage 4) ---
 //
@@ -32,8 +41,8 @@ let pool;
 const verifier = (process.env.COGNITO_USER_POOL_ID && process.env.COGNITO_CLIENT_ID)
   ? CognitoJwtVerifier.create({
       userPoolId: process.env.COGNITO_USER_POOL_ID,
-      tokenUse: 'id',
-      clientId: process.env.COGNITO_CLIENT_ID,
+      tokenUse:   'id',
+      clientId:   process.env.COGNITO_CLIENT_ID,
     })
   : null;
 
@@ -43,7 +52,7 @@ async function requireAuth(req, res, next) {
     return next();
   }
   if (!verifier) {
-    return res.status(500).json({ error: 'auth not configured — set COGNITO_USER_POOL_ID and COGNITO_CLIENT_ID' });
+    return res.status(500).json({ error: 'auth not configured' });
   }
   const auth = req.headers.authorization;
   if (!auth?.startsWith('Bearer ')) {
@@ -60,11 +69,21 @@ async function requireAuth(req, res, next) {
 // Maps pg snake_case columns → camelCase API response
 function toNote(row) {
   return {
-    id: row.id,
-    title: row.title,
-    content: row.content,
+    id:        row.id,
+    title:     row.title,
+    content:   row.content,
     createdBy: row.created_by,
     createdAt: row.created_at,
+  };
+}
+
+function toExportJob(row) {
+  return {
+    id:          row.id,
+    status:      row.status,
+    requestedAt: row.requested_at,
+    completedAt: row.completed_at ?? null,
+    error:       row.error ?? null,
   };
 }
 
@@ -78,7 +97,7 @@ const wrap = (fn) => (req, res) =>
 // --- Health (public) ---
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// --- Notes API (all routes require a valid Cognito ID token) ---
+// --- Notes API ---
 
 app.get('/api/notes', requireAuth, wrap(async (req, res) => {
   const { rows } = await pool.query(
@@ -101,13 +120,64 @@ app.post('/api/notes', requireAuth, wrap(async (req, res) => {
 }));
 
 app.delete('/api/notes/:id', requireAuth, wrap(async (req, res) => {
-  // user_id check prevents users from deleting each other's notes
   const { rowCount } = await pool.query(
     'DELETE FROM notes WHERE id = $1 AND user_id = $2',
     [req.params.id, req.user.sub]
   );
   if (rowCount === 0) return res.status(404).json({ error: 'note not found' });
   res.status(204).send();
+}));
+
+// --- Export API (Stage 5) ---
+
+// POST /api/exports — create a job row, enqueue it, return 202 immediately
+app.post('/api/exports', requireAuth, wrap(async (req, res) => {
+  if (!sqs) {
+    return res.status(503).json({ error: 'export not available (SQS_QUEUE_URL not set)' });
+  }
+
+  const { rows } = await pool.query(
+    `INSERT INTO export_jobs (user_id) VALUES ($1)
+     RETURNING id, status, requested_at`,
+    [req.user.sub]
+  );
+  const job = rows[0];
+
+  // Queue message shape:
+  // { jobId, userId, requestedAt }
+  // The worker only needs these three fields — it fetches notes from the DB itself.
+  await sqs.send(new SendMessageCommand({
+    QueueUrl:    process.env.SQS_QUEUE_URL,
+    MessageBody: JSON.stringify({
+      jobId:        job.id,
+      userId:       req.user.sub,
+      requestedAt:  job.requested_at,
+    }),
+  }));
+
+  res.status(202).json({ jobId: job.id, status: job.status });
+}));
+
+// GET /api/exports/:id — poll for job status; includes a presigned download URL when complete
+app.get('/api/exports/:id', requireAuth, wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT * FROM export_jobs WHERE id = $1 AND user_id = $2',
+    [req.params.id, req.user.sub]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'export job not found' });
+
+  const job    = rows[0];
+  const result = { ...toExportJob(job), downloadUrl: null };
+
+  if (job.status === 'completed' && job.s3_key && s3) {
+    result.downloadUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: process.env.EXPORT_BUCKET, Key: job.s3_key }),
+      { expiresIn: 3600 } // 1-hour window to download
+    );
+  }
+
+  res.json(result);
 }));
 
 // Serve React build for local dev only — in production CloudFront serves S3 directly.
@@ -127,10 +197,23 @@ async function start() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-
-  // Idempotent migration: adds user_id to any existing Stage 3 table
   await pool.query(
     `ALTER TABLE notes ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS export_jobs (
+      id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id      TEXT        NOT NULL,
+      status       TEXT        NOT NULL DEFAULT 'queued',
+      s3_key       TEXT,
+      error        TEXT,
+      requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS export_jobs_user_id_idx ON export_jobs (user_id)`
   );
 
   console.log('Schema ready');

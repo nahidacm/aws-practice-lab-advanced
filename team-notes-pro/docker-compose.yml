@@ -7,9 +7,32 @@ services:
       PORT: "3000"
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@db:5432/teamnotes
+      DEV_SKIP_AUTH: "true"
+      # Stage 5: leave these unset locally to disable the export feature,
+      # or point to real AWS SQS/S3 with credentials mounted via ~/.aws
+      # SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/<account>/team-notes-pro-exports
+      # EXPORT_BUCKET: team-notes-pro-exports-<account>
+      # AWS_REGION: us-east-1
     depends_on:
       db:
         condition: service_healthy
+
+  worker:
+    build: .
+    command: ["node", "worker.js"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/teamnotes
+      # Worker requires real AWS credentials — set these or mount ~/.aws
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
+      EXPORT_BUCKET: ${EXPORT_BUCKET:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - worker  # opt-in: docker compose --profile worker up
 
   db:
     image: postgres:16-alpine
