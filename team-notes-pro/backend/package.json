@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "aws-jwt-verify": "^4.0.1",
     "cors": "^2.8.6",
     "express": "^4.19.2",
     "pg": "^8.12.0"

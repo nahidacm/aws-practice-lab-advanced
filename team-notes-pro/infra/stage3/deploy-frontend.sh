@@ -4,18 +4,25 @@
 #   S3_BUCKET=notes-frontend-prod \
 #   CLOUDFRONT_DISTRIBUTION_ID=EXXXXXXXXXX \
 #   VITE_API_URL=https://api.notes.yourdomain.com \
+#   VITE_COGNITO_USER_POOL_ID=us-east-1_XXXXXXXXX \
+#   VITE_COGNITO_CLIENT_ID=XXXXXXXXXXXXXXXXXXXXXXXXXX \
 #   ./deploy-frontend.sh
 set -euo pipefail
 
 : "${S3_BUCKET:?S3_BUCKET is required}"
 : "${CLOUDFRONT_DISTRIBUTION_ID:?CLOUDFRONT_DISTRIBUTION_ID is required}"
 : "${VITE_API_URL:?VITE_API_URL is required}"
+: "${VITE_COGNITO_USER_POOL_ID:?VITE_COGNITO_USER_POOL_ID is required}"
+: "${VITE_COGNITO_CLIENT_ID:?VITE_COGNITO_CLIENT_ID is required}"
 
 FRONTEND_DIR="$(cd "$(dirname "$0")/../../frontend" && pwd)"
 
 echo "==> Building frontend (VITE_API_URL=$VITE_API_URL)..."
 cd "$FRONTEND_DIR"
-VITE_API_URL="$VITE_API_URL" npm run build
+VITE_API_URL="$VITE_API_URL" \
+VITE_COGNITO_USER_POOL_ID="$VITE_COGNITO_USER_POOL_ID" \
+VITE_COGNITO_CLIENT_ID="$VITE_COGNITO_CLIENT_ID" \
+npm run build
 
 echo "==> Uploading hashed assets to s3://$S3_BUCKET ..."
 # Long-lived cache for fingerprinted assets (JS/CSS have content hashes in filenames)

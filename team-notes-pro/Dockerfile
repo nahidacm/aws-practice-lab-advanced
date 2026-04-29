@@ -4,10 +4,14 @@ WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
-# Stage 3: pass the API origin at build time so the frontend bundle knows where
-# to send fetch requests. Empty string = Vite proxy handles it (local dev only).
+# Stage 3: API origin baked into the bundle. Empty = Vite proxy (local dev only).
 ARG VITE_API_URL=""
 ENV VITE_API_URL=$VITE_API_URL
+# Stage 4: Cognito pool identifiers baked into the bundle (not secrets — public values).
+ARG VITE_COGNITO_USER_POOL_ID=""
+ENV VITE_COGNITO_USER_POOL_ID=$VITE_COGNITO_USER_POOL_ID
+ARG VITE_COGNITO_CLIENT_ID=""
+ENV VITE_COGNITO_CLIENT_ID=$VITE_COGNITO_CLIENT_ID
 RUN npm run build
 
 # ── Stage 2: Install backend prod deps ───────────────────────────────────────
