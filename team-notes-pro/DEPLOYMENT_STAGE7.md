@@ -190,16 +190,29 @@ aws iam put-role-policy \
 
 ## Step 4 — Update the worker ECS task definition
 
+The worker needs `SNS_TOPIC_ARN` added, and its health check must be fixed.
+
+**Why the health check matters:** The Dockerfile bakes in `HEALTHCHECK CMD wget -qO- http://localhost:3000/health` for the API. The worker uses the same image but runs no HTTP server, so that check always fails → ECS marks the task unhealthy → task stops. The fix is to override the health check in the worker task definition with a process-level check instead.
+
 ### Console
 
 1. **ECS → Task definitions → team-notes-pro-worker** → Create new revision
-2. Container → Environment variables → add:
+2. Container → **Environment variables** → add:
 
 | Key | Value |
 |-----|-------|
 | `SNS_TOPIC_ARN` | `arn:aws:sns:us-east-1:<account_id>:team-notes-pro-export-events` |
 
-3. Create revision → **ECS → Services → team-notes-pro-worker → Update service** → select new revision → **Force new deployment**
+3. Container → **Health check** → set:
+   - Command: `CMD-SHELL, kill -0 1`
+   - Interval: `30`
+   - Timeout: `5`
+   - Start period: `30`
+   - Retries: `3`
+
+   `kill -0 1` checks that PID 1 (the node process) is alive without sending a signal — no HTTP endpoint needed.
+
+4. Create revision → **ECS → Services → team-notes-pro-worker → Update service** → select new revision → **Force new deployment**
 
 ---
 
@@ -247,6 +260,20 @@ watch -n 2 "curl -s https://api.notes.yourdomain.com/api/exports/$JOB \
 ```
 
 Within a few seconds of the job reaching `completed` or `failed`, the subscribed email address should receive a message.
+
+> **If the worker task keeps stopping as UNHEALTHY:** check that the `CMD-SHELL, kill -0 1` health check override is on the revision the service is actually running. Confirm with:
+> ```bash
+> aws ecs describe-task-definition \
+>   --task-definition team-notes-pro-worker \
+>   --query 'taskDefinition.containerDefinitions[0].healthCheck'
+> ```
+> The `command` field must be `["CMD-SHELL","kill -0 1"]`, not `["NONE"]`. Also confirm the running task is on that revision:
+> ```bash
+> aws ecs list-tasks --cluster team-notes-pro \
+>   --service-name team-notes-pro-worker --output text --query 'taskArns[0]' \
+> | xargs -I{} aws ecs describe-tasks --cluster team-notes-pro --tasks {} \
+>   --query 'tasks[0].taskDefinitionArn'
+> ```
 
 You can also publish a test message directly to verify email delivery without running a real export:
 
