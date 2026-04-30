@@ -2,7 +2,7 @@ const express = require('express');
 const path    = require('path');
 const cors    = require('cors');
 const { CognitoJwtVerifier }                   = require('aws-jwt-verify');
-const { SQSClient, SendMessageCommand }         = require('@aws-sdk/client-sqs');
+const { SFNClient, StartExecutionCommand }       = require('@aws-sdk/client-sfn');
 const { S3Client, GetObjectCommand }            = require('@aws-sdk/client-s3');
 const { getSignedUrl }                          = require('@aws-sdk/s3-request-presigner');
 const { createPool }                            = require('./db');
@@ -27,9 +27,9 @@ const notesKey = (userId) => `notes:${userId}`;
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
 
-// Only initialised when env vars are present so the API still starts in dev without SQS/S3
-const sqs = process.env.SQS_QUEUE_URL  ? new SQSClient({ region: REGION }) : null;
-const s3  = process.env.EXPORT_BUCKET  ? new S3Client({ region: REGION })  : null;
+// Only initialised when env vars are present so the API still starts in dev without SFN/S3
+const sfn = process.env.STATE_MACHINE_ARN ? new SFNClient({ region: REGION }) : null;
+const s3  = process.env.EXPORT_BUCKET     ? new S3Client({ region: REGION })  : null;
 
 // --- JWT verification (Stage 4) ---
 //
@@ -142,10 +142,11 @@ app.delete('/api/notes/:id', requireAuth, wrap(async (req, res) => {
 
 // --- Export API (Stage 5) ---
 
-// POST /api/exports — create a job row, enqueue it, return 202 immediately
+// POST /api/exports — create a job row, start Step Functions execution, return 202 immediately.
+// The state machine runs asynchronously; the client polls GET /api/exports/:id for status.
 app.post('/api/exports', requireAuth, wrap(async (req, res) => {
-  if (!sqs) {
-    return res.status(503).json({ error: 'export not available (SQS_QUEUE_URL not set)' });
+  if (!sfn) {
+    return res.status(503).json({ error: 'export not available (STATE_MACHINE_ARN not set)' });
   }
 
   const { rows } = await pool.query(
@@ -155,16 +156,13 @@ app.post('/api/exports', requireAuth, wrap(async (req, res) => {
   );
   const job = rows[0];
 
-  // Queue message shape:
-  // { jobId, userId, requestedAt }
-  // The worker only needs these three fields — it fetches notes from the DB itself.
-  await sqs.send(new SendMessageCommand({
-    QueueUrl:    process.env.SQS_QUEUE_URL,
-    MessageBody: JSON.stringify({
-      jobId:        job.id,
-      userId:       req.user.sub,
-      requestedAt:  job.requested_at,
-    }),
+  // Execution name must be unique per state machine — using the job UUID is perfect.
+  // Input shape: { jobId, userId }
+  // The Lambda actions fetch everything else they need (notes, email) from the DB.
+  await sfn.send(new StartExecutionCommand({
+    stateMachineArn: process.env.STATE_MACHINE_ARN,
+    name:            job.id,
+    input:           JSON.stringify({ jobId: job.id, userId: req.user.sub }),
   }));
 
   res.status(202).json({ jobId: job.id, status: job.status });

@@ -1,0 +1,98 @@
+{
+  "Comment": "Team Notes Pro export workflow. Each Task state invokes the same Lambda function with a different action, passing only the fields that state needs. Catch on every state routes failures to MarkFailed so the job is always left in a terminal state.",
+  "StartAt": "Validate",
+  "States": {
+    "Validate": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:853696859325:function:team-notes-pro-export",
+      "Parameters": {
+        "action": "validate",
+        "jobId.$": "$.jobId",
+        "userId.$": "$.userId"
+      },
+      "ResultPath": "$.validate",
+      "Next": "FetchNotes",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "MarkFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "FetchNotes": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:853696859325:function:team-notes-pro-export",
+      "Parameters": {
+        "action": "fetchNotes",
+        "userId.$": "$.userId"
+      },
+      "ResultPath": "$.fetch",
+      "Next": "ProcessExport",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "MarkFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "ProcessExport": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:853696859325:function:team-notes-pro-export",
+      "Parameters": {
+        "action": "processExport",
+        "jobId.$": "$.jobId",
+        "userId.$": "$.userId",
+        "notes.$": "$.fetch.notes",
+        "userEmail.$": "$.fetch.userEmail"
+      },
+      "ResultPath": "$.process",
+      "Next": "MarkComplete",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "MarkFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "MarkComplete": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:853696859325:function:team-notes-pro-export",
+      "Parameters": {
+        "action": "markComplete",
+        "jobId.$": "$.jobId",
+        "userId.$": "$.userId",
+        "s3Key.$": "$.process.s3Key",
+        "userEmail.$": "$.fetch.userEmail",
+        "noteCount.$": "$.fetch.noteCount"
+      },
+      "ResultPath": null,
+      "End": true,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "MarkFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:853696859325:function:team-notes-pro-export",
+      "Parameters": {
+        "action": "markFailed",
+        "jobId.$": "$.jobId",
+        "userId.$": "$.userId",
+        "error.$": "$.error"
+      },
+      "ResultPath": null,
+      "End": true
+    }
+  }
+}
