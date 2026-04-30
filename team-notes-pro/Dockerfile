@@ -35,6 +35,9 @@ ENV PORT=3000
 ENV NODE_ENV=production
 EXPOSE 3000
 
+# Default health check for the API — hits the /health endpoint.
+# The worker task definition overrides this with: CMD-SHELL, kill -0 1
+# because the worker has no HTTP server.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://localhost:3000/health || exit 1
 
