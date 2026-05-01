@@ -1,12 +1,24 @@
 const express = require('express');
 const path    = require('path');
 const cors    = require('cors');
-const { CognitoJwtVerifier }                   = require('aws-jwt-verify');
-const { SFNClient, StartExecutionCommand }       = require('@aws-sdk/client-sfn');
-const { S3Client, GetObjectCommand }            = require('@aws-sdk/client-s3');
-const { getSignedUrl }                          = require('@aws-sdk/s3-request-presigner');
-const { createPool }                            = require('./db');
-const { createCache }                           = require('./cache');
+const { CognitoJwtVerifier }             = require('aws-jwt-verify');
+const { SFNClient, StartExecutionCommand } = require('@aws-sdk/client-sfn');
+const { S3Client, GetObjectCommand }     = require('@aws-sdk/client-s3');
+const { getSignedUrl }                   = require('@aws-sdk/s3-request-presigner');
+const { createPool }                     = require('./db');
+const { createCache }                    = require('./cache');
+const logger                             = require('./logger');
+const { putMetric }                      = require('./metrics');
+
+// Stage 10: X-Ray traces all outbound AWS SDK calls and HTTP requests.
+// Requires the X-Ray daemon sidecar in the ECS task definition.
+// Set XRAY_ENABLED=true in ECS env vars; leave unset locally.
+let AWSXRay = null;
+if (process.env.XRAY_ENABLED === 'true') {
+  AWSXRay = require('aws-xray-sdk-core');
+  AWSXRay.config([AWSXRay.plugins.ECSPlugin]);
+  logger.info('xray.enabled');
+}
 
 const app = express();
 
@@ -18,29 +30,32 @@ app.use(cors({
 
 app.use(express.json());
 
+// X-Ray: opens a segment per request (must come before routes)
+if (AWSXRay) app.use(AWSXRay.express.openSegment('team-notes-pro-api'));
+
+// Request log — one structured line per response, queryable in Logs Insights
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    logger.info('http.request', {
+      method: req.method,
+      route:  req.path,
+      status: res.statusCode,
+      ms:     Date.now() - start,
+    });
+  });
+  next();
+});
+
 let pool;
 let cache;
 
 const notesKey = (userId) => `notes:${userId}`;
 
-// --- AWS clients (Stage 5) ---
-
 const REGION = process.env.AWS_REGION || 'us-east-1';
 
-// Only initialised when env vars are present so the API still starts in dev without SFN/S3
 const sfn = process.env.STATE_MACHINE_ARN ? new SFNClient({ region: REGION }) : null;
 const s3  = process.env.EXPORT_BUCKET     ? new S3Client({ region: REGION })  : null;
-
-// --- JWT verification (Stage 4) ---
-//
-// How it works:
-//   1. Cognito issues a signed ID token (JWT) when the user logs in.
-//   2. The frontend sends it as: Authorization: Bearer <token>
-//   3. aws-jwt-verify fetches Cognito's public JWKS once and caches them.
-//   4. It verifies the token signature, expiry, issuer, and audience — no secret needed.
-//   5. req.user is set to the decoded payload (sub = user UUID, email = user email).
-//
-// Set DEV_SKIP_AUTH=true in local dev to bypass token validation when Cognito isn't configured.
 
 const verifier = (process.env.COGNITO_USER_POOL_ID && process.env.COGNITO_CLIENT_ID)
   ? CognitoJwtVerifier.create({
@@ -70,7 +85,6 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// Maps pg snake_case columns → camelCase API response
 function toNote(row) {
   return {
     id:        row.id,
@@ -91,10 +105,11 @@ function toExportJob(row) {
   };
 }
 
-// Wraps async route handlers and returns 500 on unhandled rejection
+// Wraps async route handlers; logs + metrics on unhandled 500s
 const wrap = (fn) => (req, res) =>
   fn(req, res).catch((err) => {
-    console.error(err);
+    logger.error('request.error', { method: req.method, route: req.path, error: err.message });
+    putMetric('ApiError');
     res.status(500).json({ error: 'internal server error' });
   });
 
@@ -106,14 +121,19 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 app.get('/api/notes', requireAuth, wrap(async (req, res) => {
   const key    = notesKey(req.user.sub);
   const cached = await cache.get(key);
-  if (cached) return res.json(cached);
 
+  if (cached) {
+    putMetric('CacheHit');
+    return res.json(cached);
+  }
+
+  putMetric('CacheMiss');
   const { rows } = await pool.query(
     'SELECT * FROM notes WHERE user_id = $1 ORDER BY created_at DESC',
     [req.user.sub]
   );
   const notes = rows.map(toNote);
-  await cache.set(key, notes); // TTL 60 s — see cache.js for invalidation strategy
+  await cache.set(key, notes);
   res.json(notes);
 }));
 
@@ -126,7 +146,7 @@ app.post('/api/notes', requireAuth, wrap(async (req, res) => {
     'INSERT INTO notes (title, content, created_by, user_id) VALUES ($1, $2, $3, $4) RETURNING *',
     [title.trim(), content.trim(), req.user.email, req.user.sub]
   );
-  await cache.del(notesKey(req.user.sub)); // list changed — next GET rebuilds from DB
+  await cache.del(notesKey(req.user.sub));
   res.status(201).json(toNote(rows[0]));
 }));
 
@@ -136,39 +156,34 @@ app.delete('/api/notes/:id', requireAuth, wrap(async (req, res) => {
     [req.params.id, req.user.sub]
   );
   if (rowCount === 0) return res.status(404).json({ error: 'note not found' });
-  await cache.del(notesKey(req.user.sub)); // list changed — next GET rebuilds from DB
+  await cache.del(notesKey(req.user.sub));
   res.status(204).send();
 }));
 
-// --- Export API (Stage 5) ---
+// --- Export API ---
 
-// POST /api/exports — create a job row, start Step Functions execution, return 202 immediately.
-// The state machine runs asynchronously; the client polls GET /api/exports/:id for status.
 app.post('/api/exports', requireAuth, wrap(async (req, res) => {
   if (!sfn) {
     return res.status(503).json({ error: 'export not available (STATE_MACHINE_ARN not set)' });
   }
 
   const { rows } = await pool.query(
-    `INSERT INTO export_jobs (user_id) VALUES ($1)
-     RETURNING id, status, requested_at`,
+    `INSERT INTO export_jobs (user_id) VALUES ($1) RETURNING id, status, requested_at`,
     [req.user.sub]
   );
   const job = rows[0];
 
-  // Execution name must be unique per state machine — using the job UUID is perfect.
-  // Input shape: { jobId, userId }
-  // The Lambda actions fetch everything else they need (notes, email) from the DB.
   await sfn.send(new StartExecutionCommand({
     stateMachineArn: process.env.STATE_MACHINE_ARN,
     name:            job.id,
     input:           JSON.stringify({ jobId: job.id, userId: req.user.sub }),
   }));
 
+  putMetric('ExportStarted');
+  logger.info('export.started', { jobId: job.id });
   res.status(202).json({ jobId: job.id, status: job.status });
 }));
 
-// GET /api/exports/:id — poll for job status; includes a presigned download URL when complete
 app.get('/api/exports/:id', requireAuth, wrap(async (req, res) => {
   const { rows } = await pool.query(
     'SELECT * FROM export_jobs WHERE id = $1 AND user_id = $2',
@@ -183,14 +198,17 @@ app.get('/api/exports/:id', requireAuth, wrap(async (req, res) => {
     result.downloadUrl = await getSignedUrl(
       s3,
       new GetObjectCommand({ Bucket: process.env.EXPORT_BUCKET, Key: job.s3_key }),
-      { expiresIn: 3600 } // 1-hour window to download
+      { expiresIn: 3600 }
     );
   }
 
   res.json(result);
 }));
 
-// Serve React build for local dev only — in production CloudFront serves S3 directly.
+// X-Ray: closes the segment (must come after all routes)
+if (AWSXRay) app.use(AWSXRay.express.closeSegment());
+
+// Serve React build for local dev only
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
@@ -227,10 +245,12 @@ async function start() {
     `CREATE INDEX IF NOT EXISTS export_jobs_user_id_idx ON export_jobs (user_id)`
   );
 
-  console.log('Schema ready');
-
+  logger.info('server.ready', { port: process.env.PORT || 3000 });
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  app.listen(PORT);
 }
 
-start().catch((err) => { console.error(err); process.exit(1); });
+start().catch((err) => {
+  logger.error('server.start.failed', { error: err.message });
+  process.exit(1);
+});

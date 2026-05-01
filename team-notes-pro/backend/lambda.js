@@ -14,6 +14,7 @@
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { SNSClient, PublishCommand }  = require('@aws-sdk/client-sns');
 const { createPool }                 = require('./db');
+const logger                         = require('./logger');
 
 const REGION        = process.env.AWS_REGION || 'us-east-1';
 const EXPORT_BUCKET = process.env.EXPORT_BUCKET;
@@ -170,8 +171,7 @@ async function cleanup() {
       await s3.send(new DeleteObjectCommand({ Bucket: EXPORT_BUCKET, Key: job.s3_key }));
       deletedFiles++;
     } catch (err) {
-      // Log and continue — a missing S3 object shouldn't block the DB cleanup
-      console.error(`cleanup: failed to delete ${job.s3_key}:`, err.message);
+      logger.warn('cleanup.s3.delete.failed', { key: job.s3_key, error: err.message });
     }
   }
 
@@ -179,7 +179,7 @@ async function cleanup() {
     `DELETE FROM export_jobs WHERE requested_at < NOW() - INTERVAL '7 days'`
   );
 
-  console.log(`cleanup: removed ${rowCount} job rows, ${deletedFiles} S3 files`);
+  logger.info('cleanup.complete', { deletedJobs: rowCount, deletedFiles });
   return { deletedJobs: rowCount, deletedFiles };
 }
 
@@ -203,7 +203,7 @@ async function weeklySummary() {
     generatedAt:  new Date().toISOString(),
   };
 
-  console.log('weeklySummary:', summary);
+  logger.info('weekly.summary', summary);
 
   if (sns) {
     await sns.send(new PublishCommand({
@@ -227,7 +227,6 @@ exports.handler = async (event) => {
   const { action, ...params } = event;
   const fn = ACTIONS[action];
   if (!fn) throw new Error(`Unknown action: ${action}`);
-  // jobId is present for export actions, absent for scheduled actions
-  console.log(`[${params.jobId ?? 'scheduler'}] action=${action}`);
+  logger.info('lambda.action', { action, jobId: params.jobId ?? null });
   return fn(params);
 };
