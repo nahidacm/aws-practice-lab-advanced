@@ -1,0 +1,94 @@
+{
+  "Name": "team-notes-pro-waf",
+  "Scope": "REGIONAL",
+  "Description": "WAF for Team Notes Pro ALB — rate limiting + AWS managed protections",
+  "DefaultAction": { "Allow": {} },
+
+  "Rules": [
+
+    {
+      "_comment": "Rule 0: Rate limit — block any IP sending > 2000 requests per 5 minutes (~6 req/s sustained). Evaluated first (lowest priority number) so abusive IPs are blocked before managed rules inspect them.",
+      "Name": "RateLimit",
+      "Priority": 0,
+      "Action": { "Block": {} },
+      "Statement": {
+        "RateBasedStatement": {
+          "Limit": 2000,
+          "AggregateKeyType": "IP"
+        }
+      },
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "RateLimit"
+      }
+    },
+
+    {
+      "_comment": "Rule 1: AWS IP Reputation List — blocks IPs associated with bots, scrapers, and known malicious actors. Near-zero false positive rate, safe to set to Block.",
+      "Name": "AWSManagedRulesAmazonIpReputationList",
+      "Priority": 1,
+      "OverrideAction": { "None": {} },
+      "Statement": {
+        "ManagedRuleGroupStatement": {
+          "VendorName": "AWS",
+          "Name": "AWSManagedRulesAmazonIpReputationList"
+        }
+      },
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "AWSManagedRulesAmazonIpReputationList"
+      }
+    },
+
+    {
+      "_comment": "Rule 2: Common Rule Set (OWASP Top 10) — SQL injection, XSS, path traversal, etc. SizeRestrictions_BODY is overridden to Count because notes can legitimately be large.",
+      "Name": "AWSManagedRulesCommonRuleSet",
+      "Priority": 2,
+      "OverrideAction": { "None": {} },
+      "Statement": {
+        "ManagedRuleGroupStatement": {
+          "VendorName": "AWS",
+          "Name": "AWSManagedRulesCommonRuleSet",
+          "RuleActionOverrides": [
+            {
+              "Name": "SizeRestrictions_BODY",
+              "ActionToUse": { "Count": {} }
+            }
+          ]
+        }
+      },
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "AWSManagedRulesCommonRuleSet"
+      }
+    },
+
+    {
+      "_comment": "Rule 3: Known Bad Inputs — blocks Log4Shell, SSRF patterns, and other known exploit payloads. Very low false positive rate.",
+      "Name": "AWSManagedRulesKnownBadInputsRuleSet",
+      "Priority": 3,
+      "OverrideAction": { "None": {} },
+      "Statement": {
+        "ManagedRuleGroupStatement": {
+          "VendorName": "AWS",
+          "Name": "AWSManagedRulesKnownBadInputsRuleSet"
+        }
+      },
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "AWSManagedRulesKnownBadInputsRuleSet"
+      }
+    }
+
+  ],
+
+  "VisibilityConfig": {
+    "SampledRequestsEnabled": true,
+    "CloudWatchMetricsEnabled": true,
+    "MetricName": "team-notes-pro-waf"
+  }
+}
