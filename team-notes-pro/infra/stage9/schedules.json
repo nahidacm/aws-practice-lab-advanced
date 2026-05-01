@@ -1,0 +1,30 @@
+[
+  {
+    "_comment": "EventBridge rule — nightly export cleanup. Replace LAMBDA_ARN.",
+    "rule": {
+      "Name": "team-notes-pro-nightly-cleanup",
+      "Description": "Delete export_jobs rows and S3 files older than 7 days",
+      "ScheduleExpression": "cron(0 2 * * ? *)",
+      "State": "ENABLED"
+    },
+    "target": {
+      "Id":    "LambdaCleanup",
+      "Arn":   "LAMBDA_ARN",
+      "Input": "{\"action\":\"cleanup\"}"
+    }
+  },
+  {
+    "_comment": "EventBridge rule — weekly notes summary every Monday. Replace LAMBDA_ARN.",
+    "rule": {
+      "Name": "team-notes-pro-weekly-summary",
+      "Description": "Publish weekly notes stats to SNS",
+      "ScheduleExpression": "cron(0 8 ? * MON *)",
+      "State": "ENABLED"
+    },
+    "target": {
+      "Id":    "LambdaWeeklySummary",
+      "Arn":   "LAMBDA_ARN",
+      "Input": "{\"action\":\"weeklySummary\"}"
+    }
+  }
+]

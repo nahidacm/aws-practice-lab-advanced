@@ -11,7 +11,7 @@
 //   markComplete  — update DB, publish SNS success event
 //   markFailed    — update DB with error, publish SNS failure event
 
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { SNSClient, PublishCommand }  = require('@aws-sdk/client-sns');
 const { createPool }                 = require('./db');
 
@@ -142,14 +142,92 @@ async function markFailed({ jobId, userId, error }) {
   return { status: 'failed' };
 }
 
+// --- Stage 9: Scheduled job handlers ---
+//
+// Both are invoked directly by EventBridge on a cron schedule.
+// EventBridge passes the event payload defined in the rule target Input field:
+//   { "action": "cleanup" }  or  { "action": "weeklySummary" }
+
+// cleanup: delete export_jobs rows (and their S3 files) older than 7 days.
+// The S3 bucket already has a 7-day lifecycle rule (Stage 5), so this is a
+// belt-and-suspenders DB cleanup. Deleting from DB is necessary because the
+// lifecycle rule only removes S3 objects — the DB rows stay forever otherwise.
+async function cleanup() {
+  const db = await getPool();
+
+  // Collect S3 keys for completed jobs about to be deleted so we can remove the files too.
+  // (Failed/queued jobs have no s3_key so they're just row-deleted.)
+  const { rows } = await db.query(`
+    SELECT id, s3_key
+    FROM   export_jobs
+    WHERE  requested_at < NOW() - INTERVAL '7 days'
+    AND    s3_key IS NOT NULL
+  `);
+
+  let deletedFiles = 0;
+  for (const job of rows) {
+    try {
+      await s3.send(new DeleteObjectCommand({ Bucket: EXPORT_BUCKET, Key: job.s3_key }));
+      deletedFiles++;
+    } catch (err) {
+      // Log and continue — a missing S3 object shouldn't block the DB cleanup
+      console.error(`cleanup: failed to delete ${job.s3_key}:`, err.message);
+    }
+  }
+
+  const { rowCount } = await db.query(
+    `DELETE FROM export_jobs WHERE requested_at < NOW() - INTERVAL '7 days'`
+  );
+
+  console.log(`cleanup: removed ${rowCount} job rows, ${deletedFiles} S3 files`);
+  return { deletedJobs: rowCount, deletedFiles };
+}
+
+// weeklySummary: count notes across all users, publish a summary to SNS.
+async function weeklySummary() {
+  const db = await getPool();
+
+  const { rows: [stats] } = await db.query(`
+    SELECT
+      COUNT(*)                                                        AS total_notes,
+      COUNT(DISTINCT user_id)                                         AS total_users,
+      COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS new_this_week
+    FROM notes
+  `);
+
+  const summary = {
+    event:        'weekly.summary',
+    totalNotes:   parseInt(stats.total_notes,   10),
+    totalUsers:   parseInt(stats.total_users,   10),
+    newThisWeek:  parseInt(stats.new_this_week, 10),
+    generatedAt:  new Date().toISOString(),
+  };
+
+  console.log('weeklySummary:', summary);
+
+  if (sns) {
+    await sns.send(new PublishCommand({
+      TopicArn:  process.env.SNS_TOPIC_ARN,
+      Subject:   `Weekly Summary — ${summary.newThisWeek} new note${summary.newThisWeek !== 1 ? 's' : ''} this week`,
+      Message:   JSON.stringify(summary, null, 2),
+      MessageAttributes: {
+        event: { DataType: 'String', StringValue: 'weekly.summary' },
+      },
+    }));
+  }
+
+  return summary;
+}
+
 // --- Dispatcher ---
 
-const ACTIONS = { validate, fetchNotes, processExport, markComplete, markFailed };
+const ACTIONS = { validate, fetchNotes, processExport, markComplete, markFailed, cleanup, weeklySummary };
 
 exports.handler = async (event) => {
   const { action, ...params } = event;
   const fn = ACTIONS[action];
   if (!fn) throw new Error(`Unknown action: ${action}`);
-  console.log(`[${params.jobId}] action=${action}`);
+  // jobId is present for export actions, absent for scheduled actions
+  console.log(`[${params.jobId ?? 'scheduler'}] action=${action}`);
   return fn(params);
 };
