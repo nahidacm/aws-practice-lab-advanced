@@ -2,86 +2,48 @@
 
 ## What this stage does
 
-Replaces the manual `docker build → docker push → aws ecs update-service` workflow with an automated pipeline that triggers on every git push.
+Replaces the manual `docker build → docker push → aws ecs update-service` workflow with a pipeline that triggers automatically on every git push to `main`.
 
-**New AWS services:**
+```
+git push → Source → Build Backend + Build Frontend (parallel) → [Approve] → Deploy ECS
+```
 
-| Service | Role |
-|---------|------|
-| CodePipeline | Orchestrates the stages: source → build → deploy |
-| CodeBuild | Runs the actual build commands (Docker, npm, AWS CLI) |
-| CodeStar Connections | Securely connects CodePipeline to GitHub |
-| S3 (artifact bucket) | Temporary storage for build artifacts between pipeline stages |
+**No application code changes.** Two buildspec files were added to the repo:
+- `team-notes-pro/buildspec.yml` — Docker build, ECR push, writes `imagedefinitions.json`
+- `team-notes-pro/buildspec-frontend.yml` — npm build, S3 sync, CloudFront invalidation
 
 ---
 
-## Pipeline design
+## Architecture
 
 ```mermaid
 graph LR
-  Dev[Developer]
-  GH[GitHub\nmain branch]
+  Dev[Developer] -->|git push main| GH[GitHub]
+  GH -->|webhook| CP[CodePipeline]
 
-  subgraph Pipeline
-    direction TB
-    SRC[Source\nCodeStar Connection\nGitHub]
-    subgraph Build Stage - parallel
-      BB[Build Backend\nCodeBuild\nbuildspec.yml]
-      BF[Build Frontend\nCodeBuild\nbuildspec-frontend.yml]
-    end
-    APP[Approve\nManual gate\noptional]
-    DEP[Deploy\nECS rolling deploy\nimagedefinitions.json]
-  end
+  CP --> SRC[Stage 1\nSource]
+  SRC --> BB[Stage 2a\nBuild Backend\nCodeBuild]
+  SRC --> BF[Stage 2b\nBuild Frontend\nCodeBuild]
+  BB -->|imagedefinitions.json| APP[Stage 3\nApprove\noptional]
+  APP --> DEP[Stage 4\nDeploy ECS]
 
-  ECR[(ECR)]
-  S3F[(S3 Frontend)]
-  CF[CloudFront]
-  ECS[ECS Fargate]
-
-  Dev -->|git push| GH
-  GH -->|webhook| SRC
-  SRC --> BB & BF
-  BB -->|imagedefinitions.json| APP
-  BF -->|S3 sync + invalidate| S3F --> CF
-  APP --> DEP
-  BB -->|docker push| ECR
-  DEP -->|rolling deploy| ECS
+  BB -->|docker push| ECR[(ECR)]
+  BF -->|s3 sync| S3[(S3 + CloudFront)]
+  DEP -->|rolling deploy| ECS[ECS Fargate]
   ECR --> ECS
 ```
 
-**Two parallel build actions** — backend and frontend build independently; neither waits for the other. The ECS deploy happens only after the backend build produces `imagedefinitions.json`.
+---
+
+## Before you start
+
+Make sure you have the GitHub repo pushed and the `buildspec.yml` and `buildspec-frontend.yml` files are committed at `team-notes-pro/`.
 
 ---
 
-## What `imagedefinitions.json` is
+## Step 1 — Store build config in SSM Parameter Store
 
-CodePipeline's ECS deploy action reads this file to know which image to deploy:
-
-```json
-[{"name":"app","imageUri":"853696859325.dkr.ecr.us-east-1.amazonaws.com/team-notes-pro:abc12345"}]
-```
-
-- `name` must exactly match the container name in the ECS task definition (`app`)
-- `imageUri` uses the short commit hash as a tag, not `:latest` — this makes every deploy traceable in ECR
-
-CodePipeline creates a new task definition revision with this image URI, then updates the ECS service. If the new tasks fail health checks, ECS rolls back automatically.
-
----
-
-## Where manual approval makes sense
-
-The pipeline runs on every push. You might want a manual gate:
-
-- **Before ECS deploy:** After the build succeeds but before the new image reaches production. Useful if you want a human to review test output or a diff before it goes live.
-- **Not necessary here for:** the frontend S3 deploy — a broken frontend is easy to roll back (just re-deploy the previous commit); CloudFront serves the old files until invalidation completes.
-
-To add the Approve stage: in CodePipeline, add a stage between Build and Deploy, add an action of type "Manual approval", and configure an SNS topic for the notification email.
-
----
-
-## Step 1 — Create SSM Parameter Store parameters
-
-These hold build-time configuration that both buildspecs read. Storing them in SSM means you update one place when a value changes — no pipeline edits needed.
+Both buildspecs read these values at build time. Run once:
 
 ```bash
 aws ssm put-parameter --name "/team-notes-pro/vite-api-url" \
@@ -96,19 +58,17 @@ aws ssm put-parameter --name "/team-notes-pro/cognito-client-id" \
 
 ---
 
-## Step 2 — Create the CodeBuild service role
+## Step 2 — Create the CodeBuild IAM role
 
-Both CodeBuild projects share one IAM role.
+Both CodeBuild projects will share this role.
 
-### Console
-
-1. **IAM → Roles → Create role**
-2. Trusted entity: **AWS service → CodeBuild**
-3. Name: `codebuild-team-notes-pro-role`
-4. Attach these managed policies:
-   - `AmazonEC2ContainerRegistryPowerUser` — docker push to ECR
-   - `AmazonS3FullAccess` — sync frontend to S3 *(tighten to specific bucket in production)*
-5. Add an inline policy for the remaining permissions:
+1. Open **IAM → Roles → Create role**
+2. Trusted entity: **AWS service → CodeBuild** → Next
+3. Attach these two managed policies:
+   - `AmazonEC2ContainerRegistryPowerUser`
+   - `CloudWatchLogsFullAccess`
+4. Name the role: `codebuild-team-notes-pro-role` → Create role
+5. Open the role you just created → **Add permissions → Create inline policy → JSON:**
 
 ```json
 {
@@ -116,205 +76,169 @@ Both CodeBuild projects share one IAM role.
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": [
-        "ssm:GetParameters",
-        "ssm:GetParameter"
-      ],
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
       "Resource": "arn:aws:ssm:us-east-1:853696859325:parameter/team-notes-pro/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::team-notes-pro-frontend-853696859325",
+        "arn:aws:s3:::team-notes-pro-frontend-853696859325/*"
+      ]
     },
     {
       "Effect": "Allow",
       "Action": "cloudfront:CreateInvalidation",
       "Resource": "arn:aws:cloudfront::853696859325:distribution/E3HOSF1U0C2PIG"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-      ],
-      "Resource": "*"
     }
   ]
 }
 ```
 
----
-
-## Step 3 — Create the two CodeBuild projects
-
-> **Important:** Do not create CodeBuild projects standalone in the CodeBuild console first. The "AWS CodePipeline" source option only appears when you create a project from within the CodePipeline wizard. Create the projects in Step 5 instead — the pipeline wizard has a **"Create project"** button in the Build stage that opens an embedded CodeBuild form with source pre-set to CodePipeline automatically.
-
-If you already created projects standalone with the wrong source, delete them and recreate from inside the pipeline wizard.
+Name it `team-notes-pro-codebuild-inline` → Create policy.
 
 ---
 
-## Step 4 — Connect to GitHub
+## Step 3 — Connect CodePipeline to GitHub
 
-### Console
-
-1. **CodePipeline → Settings → Connections → Create connection**
-2. Provider: **GitHub**
-3. Connection name: `team-notes-pro-github`
-4. Click **Connect to GitHub** → authorize the AWS Connector app
-5. Click **Connect** — status changes to **Available**
-6. Copy the connection ARN
+1. Open **CodePipeline → Settings → Connections → Create connection**
+2. Provider: **GitHub** → Connection name: `team-notes-pro-github` → Connect to GitHub
+3. Authorize the AWS Connector GitHub App when prompted
+4. Click **Connect** — wait for status to show **Available**
 
 ---
 
-## Step 5 — Create the pipeline
+## Step 4 — Create the pipeline
 
-### Console
+Open **CodePipeline → Pipelines → Create pipeline**.
 
-1. **CodePipeline → Create pipeline**
+### Screen 1 — Choose creation option
+- Select **Build custom pipeline**
+- Click **Next**
 
-2. **Pipeline settings:**
-   - Name: `team-notes-pro`
-   - New service role (let AWS create it)
-   - Artifact store: **Default location** (CodePipeline creates an S3 bucket)
+### Screen 2 — Choose source
+- **Pipeline name:** `team-notes-pro`
+- **Execution mode:** Superseded
+- **Service role:** New service role (let AWS create it)
+- **Source provider:** GitHub (via GitHub App)
+- **Connection:** `team-notes-pro-github`
+- **Repository:** your repo (e.g. `your-username/aws-practice-lab-advanced`)
+- **Branch:** `main`
+- Click **Next**
 
-3. **Source stage:**
-   - Source provider: **GitHub (Version 2)**
-   - Connection: `team-notes-pro-github`
-   - Repository: `your-username/aws-practice-lab-advanced`
-   - Branch: `main`
-   - Output artifact format: **CodePipeline default**
+### Screen 3 — Configure template
 
-4. **Build stage:**
-   - Click **Add action group** (this creates a parallel group)
+This screen lets you add pipeline stages. You need to add a Build stage and a Deploy stage.
 
-   **Action 1 — BuildBackend:**
-   - Action name: `BuildBackend`
-   - Action provider: **CodeBuild**
-   - Input artifacts: `SourceArtifact`
-   - Click **Create project** — a panel opens with source already set to **AWS CodePipeline**:
-     - Project name: `team-notes-pro-backend`
-     - Environment image: **Managed image**
-     - Operating system: **Amazon Linux**
-     - Runtime: **Standard**
-     - Image: **aws/codebuild/amazonlinux-x86_64-standard:5.0**
-     - Privileged: ✅ **Enable this flag** (required for `docker build`)
-     - Service role: select `codebuild-team-notes-pro-role`
-     - Buildspec: **Use a buildspec file** → Buildspec name: `team-notes-pro/buildspec.yml`
-     - Click **Continue to CodePipeline**
-   - Output artifacts: `BackendBuildArtifact`
+**Add the Build stage:**
 
-   **Action 2 — BuildFrontend (click "Add action" in the same action group → runs in parallel):**
-   - Action name: `BuildFrontend`
-   - Action provider: **CodeBuild**
-   - Input artifacts: `SourceArtifact`
-   - Click **Create project**:
-     - Project name: `team-notes-pro-frontend`
-     - Environment image: **Managed image** (same as above)
-     - Privileged: not required (no Docker)
-     - Service role: `codebuild-team-notes-pro-role`
-     - Buildspec: **Use a buildspec file** → `team-notes-pro/buildspec-frontend.yml`
-     - Click **Continue to CodePipeline**
-   - Output artifacts: *(leave blank — deploys directly to S3)*
+1. Click **Add build stage**
+2. Action name: `BuildBackend`
+3. Build provider: **AWS CodeBuild**
+4. Click **Create project** — a panel opens. Fill it in:
+   - Project name: `team-notes-pro-backend`
+   - Environment image: **Managed image**
+   - OS: **Amazon Linux** / Runtime: **Standard** / Image: `aws/codebuild/amazonlinux-x86_64-standard:5.0`
+   - Privileged: ✅ **Enable** ← required for `docker build`
+   - Service role: **Existing role** → `codebuild-team-notes-pro-role`
+   - Buildspec: **Use a buildspec file** → name: `team-notes-pro/buildspec.yml`
+   - Click **Continue to CodePipeline**
+5. Output artifacts: `BackendBuild`
 
-5. **[Optional] Approve stage:**
-   - Add stage → name it `Approve`
-   - Add action → type: **Manual approval**
-   - SNS topic ARN: use `team-notes-pro-alarms` or create a new one
-   - Comments: "Review build logs before deploying to ECS"
+**Add the frontend as a parallel action in the same Build stage:**
 
-6. **Deploy stage:**
-   - Action provider: **Amazon ECS**
-   - Input artifacts: `BackendBuildArtifact`
-   - Cluster name: `team-notes-pro`
-   - Service name: `team-notes-pro-svc`
-   - Image definitions file: `imagedefinitions.json`
+6. Look for **Add action** (within the same Build stage, not a new stage) — this adds a parallel action
+7. Action name: `BuildFrontend`
+8. Build provider: **AWS CodeBuild**
+9. Click **Create project**:
+   - Project name: `team-notes-pro-frontend`
+   - Same environment settings as above
+   - Privileged: leave unchecked
+   - Service role: `codebuild-team-notes-pro-role`
+   - Buildspec: **Use a buildspec file** → `team-notes-pro/buildspec-frontend.yml`
+   - Click **Continue to CodePipeline**
+10. Output artifacts: leave blank
 
-7. Click **Create pipeline** — it will trigger immediately with the current `main` branch
+**Add the Deploy stage:**
+
+11. Click **Add deploy stage**
+12. Deploy provider: **Amazon ECS**
+13. Input artifact: `BackendBuild`
+14. Cluster name: `team-notes-pro`
+15. Service name: `team-notes-pro-svc`
+16. Image definitions file: `imagedefinitions.json`
+
+Click **Create pipeline**.
+
+The pipeline triggers immediately with the current `main` branch.
 
 ---
 
-## Step 6 — Grant CodePipeline permission to pass the CodeBuild role
+## Step 5 — Add manual approval (optional)
 
-CodePipeline's auto-created service role needs `iam:PassRole` to use the CodeBuild role:
+A manual approval gate lets you review the build output before it deploys to ECS. Useful when you want a human to confirm before a production change goes live.
+
+To add it:
+1. Open the pipeline → **Edit**
+2. Click **Add stage** between the Build and Deploy stages
+3. Stage name: `Approve`
+4. Click **Add action group** → Action name: `ManualApproval`, Action provider: **Manual approval**
+5. SNS topic ARN: (optional) paste an SNS topic to receive an email when approval is needed
+6. Click **Done** → **Save**
+
+---
+
+## Step 6 — Verify the first run
+
+Watch the pipeline execute:
 
 ```bash
-PIPELINE_ROLE=$(aws codepipeline get-pipeline \
+aws codepipeline get-pipeline-state \
   --name team-notes-pro \
-  --query 'pipeline.roleArn' --output text | sed 's|.*/||')
-
-aws iam put-role-policy \
-  --role-name "$PIPELINE_ROLE" \
-  --policy-name pass-codebuild-role \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::853696859325:role/codebuild-team-notes-pro-role"
-    }]
-  }'
+  --query 'stageStates[*].{Stage:stageName,Status:latestExecution.status}' \
+  --output table
 ```
+
+If a build fails, go to **CodeBuild → Build history** → click the failed build → **Build logs** to see the exact error.
+
+Common first-run failures and fixes:
+
+| Error | Fix |
+|-------|-----|
+| `Error: Cannot perform an interactive login` | Check the CodeBuild role has `AmazonEC2ContainerRegistryPowerUser` |
+| `Parameter not found: /team-notes-pro/...` | Re-run Step 1 to create the SSM parameters |
+| `AccessDenied on s3:PutObject` | Check the inline policy bucket ARN matches your actual bucket name |
+| `AccessDenied on cloudfront:CreateInvalidation` | Check the inline policy distribution ID matches yours |
 
 ---
 
-## How a deploy works end-to-end
+## What happens on each push
 
 ```
 git push origin main
-  │
-  ├─ CodePipeline detects push (webhook from CodeStar Connection)
-  │
-  ├─ Source: downloads zip of repo → S3 artifact bucket
-  │
-  ├─ Build [parallel]:
-  │   ├─ BuildBackend (3–5 min):
-  │   │   docker build → ECR push → writes imagedefinitions.json
-  │   └─ BuildFrontend (1–2 min):
-  │       npm ci → npm run build → S3 sync → CF invalidation
-  │
-  ├─ [Approve: human reviews, clicks Approve in console]
-  │
-  └─ Deploy (1–3 min):
-      CodePipeline reads imagedefinitions.json
-      → registers new ECS task definition revision
-      → starts rolling deploy (new tasks, drain old tasks)
-      → waits for service to stabilize
+     │
+     ├─ CodePipeline detects the push via GitHub webhook
+     ├─ Downloads a zip of the repo into the pipeline artifact bucket
+     │
+     ├─ [parallel, ~4 min]
+     │   ├─ BuildBackend:  docker build → ECR push → imagedefinitions.json
+     │   └─ BuildFrontend: npm ci → npm run build → S3 sync → CF invalidate
+     │
+     ├─ [optional] Manual approval
+     │
+     └─ Deploy: registers new ECS task definition → rolling deploy
+                new tasks start → old tasks drain → service stable
 ```
 
-Total time: ~7–10 minutes from push to live (5 min if skipping manual approval).
+Total: ~7 minutes push to live (without approval gate).
 
 ---
 
-## Verifying a pipeline run
-
-```bash
-# Watch the latest execution
-aws codepipeline list-pipeline-executions \
-  --pipeline-name team-notes-pro \
-  --query 'pipelineExecutionSummaries[:3].{id:pipelineExecutionId,status:status,trigger:trigger.triggerType}' \
-  --output table
-
-# Get detailed status of each stage
-aws codepipeline get-pipeline-state \
-  --name team-notes-pro \
-  --query 'stageStates[*].{stage:stageName,status:latestExecution.status}' \
-  --output table
-```
-
-If a build fails, go to **CodeBuild → Build history → click the failed build → Build logs** — it streams in real time.
-
----
-
-## Cost estimate
+## Cost
 
 | Resource | Cost |
 |----------|------|
 | CodePipeline | $1.00/month per active pipeline |
-| CodeBuild | Free tier: 100 build-minutes/month. After: $0.005/min for small instance |
-| S3 artifact bucket | ~$0.01/month |
-| CodeStar Connection | Free |
-
-A typical push uses ~8 minutes of CodeBuild time. At $0.005/min that's $0.04/push after the free tier.
-
----
-
-## What's next — Stage 13
-
-Stage 13 converts the entire infrastructure — VPC, ECS, RDS, ElastiCache, S3, CloudFront, WAF, EventBridge, Step Functions — into code using **AWS CDK** or **Terraform**, replacing the manual console and CLI steps done throughout this lab.
+| CodeBuild | Free tier: 100 build-minutes/month. ~8 min per push = ~12 free pushes/month |
+| S3 artifact bucket | < $0.01/month |
