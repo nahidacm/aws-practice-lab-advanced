@@ -2,13 +2,12 @@
 
 ## What this stage does
 
-Replaces the manual `docker build → docker push → aws ecs update-service` workflow with a pipeline that triggers automatically on every git push to `main`.
+Every `git push origin main` automatically:
+1. Builds the Docker image and pushes it to ECR
+2. Deploys the frontend to S3 + CloudFront
+3. Rolls out the new image to ECS
 
-```
-git push → Source → Build Backend + Build Frontend (parallel) → [Approve] → Deploy ECS
-```
-
-**No application code changes.** Two buildspec files were added to the repo:
+Two buildspec files live in the repo:
 - `team-notes-pro/buildspec.yml` — Docker build, ECR push, writes `imagedefinitions.json`
 - `team-notes-pro/buildspec-frontend.yml` — npm build, S3 sync, CloudFront invalidation
 
@@ -20,13 +19,10 @@ git push → Source → Build Backend + Build Frontend (parallel) → [Approve] 
 graph LR
   Dev[Developer] -->|git push main| GH[GitHub]
   GH -->|webhook| CP[CodePipeline]
-
-  CP --> SRC[Stage 1\nSource]
-  SRC --> BB[Stage 2a\nBuild Backend\nCodeBuild]
-  SRC --> BF[Stage 2b\nBuild Frontend\nCodeBuild]
-  BB -->|imagedefinitions.json| APP[Stage 3\nApprove\noptional]
-  APP --> DEP[Stage 4\nDeploy ECS]
-
+  CP --> SRC[Source]
+  SRC --> BB[Build Backend\nCodeBuild]
+  SRC --> BF[Build Frontend\nCodeBuild]
+  BB -->|imagedefinitions.json| DEP[Deploy ECS]
   BB -->|docker push| ECR[(ECR)]
   BF -->|s3 sync| S3[(S3 + CloudFront)]
   DEP -->|rolling deploy| ECS[ECS Fargate]
@@ -35,210 +31,393 @@ graph LR
 
 ---
 
-## Before you start
+## Prerequisites
 
-Make sure you have the GitHub repo pushed and the `buildspec.yml` and `buildspec-frontend.yml` files are committed at `team-notes-pro/`.
+- GitHub connection already created (`team-notes-pro-github`)
+- SSM parameters already set (verify with `aws ssm get-parameters-by-path --path /team-notes-pro --query 'Parameters[*].Name' --output text`)
 
----
-
-## Step 1 — Store build config in SSM Parameter Store
-
-Both buildspecs read these values at build time. Run once:
-
+If SSM parameters are missing, create them:
 ```bash
 aws ssm put-parameter --name "/team-notes-pro/vite-api-url" \
-  --value "https://api.notes.ehm23.com" --type String --overwrite
+  --value "https://api.notes.yourdomain.com" --type String --overwrite
 
 aws ssm put-parameter --name "/team-notes-pro/cognito-user-pool-id" \
-  --value "us-east-1_hXPK9kZRa" --type String --overwrite
+  --value "us-east-1_XXXXXXXXX" --type String --overwrite
 
 aws ssm put-parameter --name "/team-notes-pro/cognito-client-id" \
-  --value "4309f2d68f7hvnlm0dngndcen8" --type String --overwrite
+  --value "XXXXXXXXXXXXXXXXXXXXXXXXXX" --type String --overwrite
 ```
 
 ---
 
-## Step 2 — Create the CodeBuild IAM role
+## Step 1 — Create the CodeBuild IAM role
 
-Both CodeBuild projects will share this role.
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION=us-east-1
 
-1. Open **IAM → Roles → Create role**
-2. Trusted entity: **AWS service → CodeBuild** → Next
-3. Attach these two managed policies:
-   - `AmazonEC2ContainerRegistryPowerUser`
-   - `CloudWatchLogsFullAccess`
-4. Name the role: `codebuild-team-notes-pro-role` → Create role
-5. Open the role you just created → **Add permissions → Create inline policy → JSON:**
+aws iam create-role \
+  --role-name codebuild-team-notes-pro-role \
+  --assume-role-policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{
+      "Effect":"Allow",
+      "Principal":{"Service":"codebuild.amazonaws.com"},
+      "Action":"sts:AssumeRole"
+    }]
+  }' \
+  --query 'Role.RoleName' --output text
 
-```json
+aws iam attach-role-policy \
+  --role-name codebuild-team-notes-pro-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+
+aws iam attach-role-policy \
+  --role-name codebuild-team-notes-pro-role \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+aws iam put-role-policy \
+  --role-name codebuild-team-notes-pro-role \
+  --policy-name team-notes-pro-codebuild \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": [\"ssm:GetParameter\",\"ssm:GetParameters\"],
+        \"Resource\": \"arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/team-notes-pro/*\"
+      },
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:GetObject\",\"s3:GetObjectVersion\",\"s3:PutObject\",\"s3:GetBucketAcl\",\"s3:GetBucketLocation\"],
+        \"Resource\": [
+          \"arn:aws:s3:::codepipeline-team-notes-pro-${ACCOUNT_ID}\",
+          \"arn:aws:s3:::codepipeline-team-notes-pro-${ACCOUNT_ID}/*\"
+        ]
+      },
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\",\"s3:GetObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::team-notes-pro-frontend-${ACCOUNT_ID}\",
+          \"arn:aws:s3:::team-notes-pro-frontend-${ACCOUNT_ID}/*\"
+        ]
+      },
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": \"cloudfront:CreateInvalidation\",
+        \"Resource\": \"arn:aws:cloudfront::${ACCOUNT_ID}:distribution/*\"
+      }
+    ]
+  }"
+```
+
+---
+
+## Step 2 — Create the CodeBuild projects
+
+> **Important:** Create projects via CLI with `type=CODEPIPELINE` as the source type. The console does not show "AWS CodePipeline" as a source option unless you create the project from inside the pipeline wizard — using the CLI avoids that confusion entirely.
+
+```bash
+ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/codebuild-team-notes-pro-role"
+
+# Backend — needs Docker (privilegedMode=true)
+aws codebuild create-project \
+  --name team-notes-pro-backend \
+  --source "type=CODEPIPELINE,buildspec=team-notes-pro/buildspec.yml" \
+  --artifacts "type=CODEPIPELINE" \
+  --environment "type=LINUX_CONTAINER,computeType=BUILD_GENERAL1_SMALL,image=aws/codebuild/standard:7.0,privilegedMode=true" \
+  --service-role "$ROLE_ARN" \
+  --query 'project.name' --output text
+
+# Frontend — no Docker needed
+aws codebuild create-project \
+  --name team-notes-pro-frontend \
+  --source "type=CODEPIPELINE,buildspec=team-notes-pro/buildspec-frontend.yml" \
+  --artifacts "type=CODEPIPELINE" \
+  --environment "type=LINUX_CONTAINER,computeType=BUILD_GENERAL1_SMALL,image=aws/codebuild/standard:7.0,privilegedMode=false" \
+  --service-role "$ROLE_ARN" \
+  --query 'project.name' --output text
+```
+
+---
+
+## Step 3 — Create the pipeline artifact bucket
+
+```bash
+ARTIFACT_BUCKET="codepipeline-team-notes-pro-${ACCOUNT_ID}"
+
+aws s3api create-bucket \
+  --bucket "$ARTIFACT_BUCKET" \
+  --region "$REGION"
+```
+
+---
+
+## Step 4 — Create the CodePipeline service role
+
+```bash
+aws iam create-role \
+  --role-name codepipeline-team-notes-pro-role \
+  --assume-role-policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{
+      "Effect":"Allow",
+      "Principal":{"Service":"codepipeline.amazonaws.com"},
+      "Action":"sts:AssumeRole"
+    }]
+  }' \
+  --query 'Role.RoleName' --output text
+
+aws iam attach-role-policy \
+  --role-name codepipeline-team-notes-pro-role \
+  --policy-arn arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess
+
+CONNECTION_ARN=$(aws codestar-connections list-connections \
+  --query 'Connections[?ConnectionName==`team-notes-pro-github`].ConnectionArn' \
+  --output text)
+
+aws iam put-role-policy \
+  --role-name codepipeline-team-notes-pro-role \
+  --policy-name codepipeline-team-notes-pro-inline \
+  --policy-document "{
+    \"Version\":\"2012-10-17\",
+    \"Statement\":[
+      {
+        \"Effect\":\"Allow\",
+        \"Action\":[\"codebuild:BatchGetBuilds\",\"codebuild:StartBuild\",\"codebuild:StopBuild\"],
+        \"Resource\":\"*\"
+      },
+      {
+        \"Effect\":\"Allow\",
+        \"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:GetBucketVersioning\"],
+        \"Resource\":[
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/*\"
+        ]
+      },
+      {
+        \"Effect\":\"Allow\",
+        \"Action\":\"codestar-connections:UseConnection\",
+        \"Resource\":\"${CONNECTION_ARN}\"
+      },
+      {
+        \"Effect\":\"Allow\",
+        \"Action\":[
+          \"ecs:DescribeServices\",\"ecs:DescribeTaskDefinition\",
+          \"ecs:RegisterTaskDefinition\",\"ecs:UpdateService\"
+        ],
+        \"Resource\":\"*\"
+      },
+      {
+        \"Effect\":\"Allow\",
+        \"Action\":\"iam:PassRole\",
+        \"Resource\":\"*\"
+      }
+    ]
+  }"
+```
+
+---
+
+## Step 5 — Create the pipeline
+
+Replace `YOUR_GITHUB_USERNAME` with your GitHub username, then run:
+
+```bash
+PIPELINE_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/codepipeline-team-notes-pro-role"
+CONNECTION_ARN=$(aws codestar-connections list-connections \
+  --query 'Connections[?ConnectionName==`team-notes-pro-github`].ConnectionArn' \
+  --output text)
+
+cat > /tmp/pipeline.json << EOF
 {
-  "Version": "2012-10-17",
-  "Statement": [
+  "name": "team-notes-pro",
+  "roleArn": "${PIPELINE_ROLE}",
+  "artifactStore": {
+    "type": "S3",
+    "location": "${ARTIFACT_BUCKET}"
+  },
+  "stages": [
     {
-      "Effect": "Allow",
-      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
-      "Resource": "arn:aws:ssm:us-east-1:853696859325:parameter/team-notes-pro/*"
+      "name": "Source",
+      "actions": [{
+        "name": "Source",
+        "actionTypeId": {
+          "category": "Source",
+          "owner": "AWS",
+          "provider": "CodeStarSourceConnection",
+          "version": "1"
+        },
+        "configuration": {
+          "ConnectionArn": "${CONNECTION_ARN}",
+          "FullRepositoryId": "YOUR_GITHUB_USERNAME/aws-practice-lab-advanced",
+          "BranchName": "main",
+          "OutputArtifactFormat": "CODE_ZIP"
+        },
+        "outputArtifacts": [{"name": "SourceArtifact"}],
+        "runOrder": 1
+      }]
     },
     {
-      "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::team-notes-pro-frontend-853696859325",
-        "arn:aws:s3:::team-notes-pro-frontend-853696859325/*"
+      "name": "Build",
+      "actions": [
+        {
+          "name": "BuildBackend",
+          "actionTypeId": {
+            "category": "Build",
+            "owner": "AWS",
+            "provider": "CodeBuild",
+            "version": "1"
+          },
+          "configuration": { "ProjectName": "team-notes-pro-backend" },
+          "inputArtifacts": [{"name": "SourceArtifact"}],
+          "outputArtifacts": [{"name": "BackendBuild"}],
+          "runOrder": 1
+        },
+        {
+          "name": "BuildFrontend",
+          "actionTypeId": {
+            "category": "Build",
+            "owner": "AWS",
+            "provider": "CodeBuild",
+            "version": "1"
+          },
+          "configuration": { "ProjectName": "team-notes-pro-frontend" },
+          "inputArtifacts": [{"name": "SourceArtifact"}],
+          "outputArtifacts": [],
+          "runOrder": 1
+        }
       ]
     },
     {
-      "Effect": "Allow",
-      "Action": "cloudfront:CreateInvalidation",
-      "Resource": "arn:aws:cloudfront::853696859325:distribution/E3HOSF1U0C2PIG"
+      "name": "Deploy",
+      "actions": [{
+        "name": "DeployECS",
+        "actionTypeId": {
+          "category": "Deploy",
+          "owner": "AWS",
+          "provider": "ECS",
+          "version": "1"
+        },
+        "configuration": {
+          "ClusterName": "team-notes-pro",
+          "ServiceName": "team-notes-pro-svc",
+          "FileName": "imagedefinitions.json"
+        },
+        "inputArtifacts": [{"name": "BackendBuild"}],
+        "runOrder": 1
+      }]
     }
   ]
 }
+EOF
+
+aws codepipeline create-pipeline \
+  --pipeline file:///tmp/pipeline.json \
+  --query 'pipeline.name' --output text
 ```
 
-Name it `team-notes-pro-codebuild-inline` → Create policy.
-
 ---
 
-## Step 3 — Connect CodePipeline to GitHub
-
-1. Open **CodePipeline → Settings → Connections → Create connection**
-2. Provider: **GitHub** → Connection name: `team-notes-pro-github` → Connect to GitHub
-3. Authorize the AWS Connector GitHub App when prompted
-4. Click **Connect** — wait for status to show **Available**
-
----
-
-## Step 4 — Create the pipeline
-
-Open **CodePipeline → Pipelines → Create pipeline**.
-
-### Screen 1 — Choose creation option
-- Select **Build custom pipeline**
-- Click **Next**
-
-### Screen 2 — Choose source
-- **Pipeline name:** `team-notes-pro`
-- **Execution mode:** Superseded
-- **Service role:** New service role (let AWS create it)
-- **Source provider:** GitHub (via GitHub App)
-- **Connection:** `team-notes-pro-github`
-- **Repository:** your repo (e.g. `your-username/aws-practice-lab-advanced`)
-- **Branch:** `main`
-- Click **Next**
-
-### Screen 3 — Configure template
-
-This screen lets you add pipeline stages. You need to add a Build stage and a Deploy stage.
-
-**Add the Build stage:**
-
-1. Click **Add build stage**
-2. Action name: `BuildBackend`
-3. Build provider: **AWS CodeBuild**
-4. Click **Create project** — a panel opens. Fill it in:
-   - Project name: `team-notes-pro-backend`
-   - Environment image: **Managed image**
-   - OS: **Amazon Linux** / Runtime: **Standard** / Image: `aws/codebuild/amazonlinux-x86_64-standard:5.0`
-   - Privileged: ✅ **Enable** ← required for `docker build`
-   - Service role: **Existing role** → `codebuild-team-notes-pro-role`
-   - Buildspec: **Use a buildspec file** → name: `team-notes-pro/buildspec.yml`
-   - Click **Continue to CodePipeline**
-5. Output artifacts: `BackendBuild`
-
-**Add the frontend as a parallel action in the same Build stage:**
-
-6. Look for **Add action** (within the same Build stage, not a new stage) — this adds a parallel action
-7. Action name: `BuildFrontend`
-8. Build provider: **AWS CodeBuild**
-9. Click **Create project**:
-   - Project name: `team-notes-pro-frontend`
-   - Same environment settings as above
-   - Privileged: leave unchecked
-   - Service role: `codebuild-team-notes-pro-role`
-   - Buildspec: **Use a buildspec file** → `team-notes-pro/buildspec-frontend.yml`
-   - Click **Continue to CodePipeline**
-10. Output artifacts: leave blank
-
-**Add the Deploy stage:**
-
-11. Click **Add deploy stage**
-12. Deploy provider: **Amazon ECS**
-13. Input artifact: `BackendBuild`
-14. Cluster name: `team-notes-pro`
-15. Service name: `team-notes-pro-svc`
-16. Image definitions file: `imagedefinitions.json`
-
-Click **Create pipeline**.
-
-The pipeline triggers immediately with the current `main` branch.
-
----
-
-## Step 5 — Add manual approval (optional)
-
-A manual approval gate lets you review the build output before it deploys to ECS. Useful when you want a human to confirm before a production change goes live.
-
-To add it:
-1. Open the pipeline → **Edit**
-2. Click **Add stage** between the Build and Deploy stages
-3. Stage name: `Approve`
-4. Click **Add action group** → Action name: `ManualApproval`, Action provider: **Manual approval**
-5. SNS topic ARN: (optional) paste an SNS topic to receive an email when approval is needed
-6. Click **Done** → **Save**
-
----
-
-## Step 6 — Verify the first run
-
-Watch the pipeline execute:
+## Step 6 — Trigger the first run
 
 ```bash
-aws codepipeline get-pipeline-state \
+aws codepipeline start-pipeline-execution \
   --name team-notes-pro \
+  --query 'pipelineExecutionId' --output text
+```
+
+Watch progress:
+
+```bash
+watch -n 10 "aws codepipeline get-pipeline-state --name team-notes-pro \
+  --query 'stageStates[*].{Stage:stageName,Status:latestExecution.status}' \
+  --output table"
+```
+
+Or check once:
+
+```bash
+aws codepipeline get-pipeline-state --name team-notes-pro \
   --query 'stageStates[*].{Stage:stageName,Status:latestExecution.status}' \
   --output table
 ```
 
-If a build fails, go to **CodeBuild → Build history** → click the failed build → **Build logs** to see the exact error.
+---
 
-Common first-run failures and fixes:
+## Adding a manual approval gate (optional)
 
-| Error | Fix |
-|-------|-----|
-| `Error: Cannot perform an interactive login` | Check the CodeBuild role has `AmazonEC2ContainerRegistryPowerUser` |
-| `Parameter not found: /team-notes-pro/...` | Re-run Step 1 to create the SSM parameters |
-| `AccessDenied on s3:PutObject` | Check the inline policy bucket ARN matches your actual bucket name |
-| `AccessDenied on cloudfront:CreateInvalidation` | Check the inline policy distribution ID matches yours |
+Insert an Approve stage between Build and Deploy:
+
+```bash
+# Get current pipeline definition
+aws codepipeline get-pipeline --name team-notes-pro \
+  --query 'pipeline' > /tmp/pipeline-current.json
+
+# Edit /tmp/pipeline-current.json to add this stage between Build and Deploy:
+# {
+#   "name": "Approve",
+#   "actions": [{
+#     "name": "ManualApproval",
+#     "actionTypeId": {
+#       "category": "Approval",
+#       "owner": "AWS",
+#       "provider": "Manual",
+#       "version": "1"
+#     },
+#     "configuration": {},
+#     "runOrder": 1
+#   }]
+# }
+
+# Then update:
+aws codepipeline update-pipeline --pipeline file:///tmp/pipeline-current.json
+```
 
 ---
 
-## What happens on each push
+## Debugging a failed build
 
-```
-git push origin main
-     │
-     ├─ CodePipeline detects the push via GitHub webhook
-     ├─ Downloads a zip of the repo into the pipeline artifact bucket
-     │
-     ├─ [parallel, ~4 min]
-     │   ├─ BuildBackend:  docker build → ECR push → imagedefinitions.json
-     │   └─ BuildFrontend: npm ci → npm run build → S3 sync → CF invalidate
-     │
-     ├─ [optional] Manual approval
-     │
-     └─ Deploy: registers new ECS task definition → rolling deploy
-                new tasks start → old tasks drain → service stable
-```
+```bash
+# Check which stage/action failed
+aws codepipeline get-pipeline-state --name team-notes-pro \
+  --query 'stageStates[*].actionStates[*].{action:actionName,status:latestExecution.status,msg:latestExecution.errorDetails.message}' \
+  --output json
 
-Total: ~7 minutes push to live (without approval gate).
+# Get the latest CodeBuild log for the backend project
+BUILD_ID=$(aws codebuild list-builds-for-project \
+  --project-name team-notes-pro-backend \
+  --query 'ids[0]' --output text)
+
+LOG_GROUP=$(aws codebuild batch-get-builds --ids "$BUILD_ID" \
+  --query 'builds[0].logs.groupName' --output text)
+LOG_STREAM=$(aws codebuild batch-get-builds --ids "$BUILD_ID" \
+  --query 'builds[0].logs.streamName' --output text)
+
+aws logs get-log-events \
+  --log-group-name "$LOG_GROUP" \
+  --log-stream-name "$LOG_STREAM" \
+  --limit 30 \
+  --query 'events[*].message' \
+  --output text | tail -30
+
+# Check ECS events if deploy fails
+aws ecs describe-services \
+  --cluster team-notes-pro \
+  --services team-notes-pro-svc \
+  --query 'services[0].events[:5].message' \
+  --output table
+```
 
 ---
 
-## Cost
+## Things that must be correct for the pipeline to work
 
-| Resource | Cost |
-|----------|------|
-| CodePipeline | $1.00/month per active pipeline |
-| CodeBuild | Free tier: 100 build-minutes/month. ~8 min per push = ~12 free pushes/month |
-| S3 artifact bucket | < $0.01/month |
+| Thing | Why it matters |
+|-------|---------------|
+| Dockerfile uses `public.ecr.aws/docker/library/node:20-alpine` | Docker Hub rate-limits unauthenticated pulls in CodeBuild — always use ECR Public |
+| `buildspec.yml` writes `imagedefinitions.json` to `$CODEBUILD_SRC_DIR` | The `cd team-notes-pro` in the build phase persists to post_build — `$CODEBUILD_SRC_DIR` is always the repo root |
+| `buildspec-frontend.yml` uses `$CODEBUILD_SRC_DIR` for all paths | Same reason — `cd` state carries across phases |
+| ECS container name in `imagedefinitions.json` matches task definition | Must be `app`, not `team-notes-pro` — check with `aws ecs describe-task-definition --task-definition team-notes-pro --query 'taskDefinition.containerDefinitions[*].name'` |
+| `aws-xray-sdk-core` does not expose `.express` | The express middleware is in `aws-xray-sdk-express` (separate package) — calling `AWSXRay.express.openSegment()` crashes the server |
