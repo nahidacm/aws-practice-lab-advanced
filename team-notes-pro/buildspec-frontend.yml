@@ -1,0 +1,53 @@
+version: 0.2
+# Frontend buildspec — builds React + Tailwind and deploys to S3 + CloudFront.
+#
+# This runs in parallel with the backend build (same pipeline Build stage).
+# It mirrors infra/stage3/deploy-frontend.sh but runs inside CodeBuild instead
+# of a developer's machine, so deploys happen automatically on every push.
+
+env:
+  variables:
+    # Set these in the CodeBuild project environment, or use SSM (see below)
+    S3_BUCKET: "team-notes-pro-frontend-853696859325"
+    CLOUDFRONT_DISTRIBUTION_ID: "E3HOSF1U0C2PIG"
+  parameter-store:
+    VITE_API_URL:               "/team-notes-pro/vite-api-url"
+    VITE_COGNITO_USER_POOL_ID:  "/team-notes-pro/cognito-user-pool-id"
+    VITE_COGNITO_CLIENT_ID:     "/team-notes-pro/cognito-client-id"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - cd team-notes-pro/frontend
+      - npm ci
+
+  build:
+    commands:
+      - cd team-notes-pro/frontend
+      - VITE_API_URL=$VITE_API_URL
+        VITE_COGNITO_USER_POOL_ID=$VITE_COGNITO_USER_POOL_ID
+        VITE_COGNITO_CLIENT_ID=$VITE_COGNITO_CLIENT_ID
+        npm run build
+
+  post_build:
+    commands:
+      - cd team-notes-pro/frontend
+      # Hashed assets (JS/CSS) — long-lived immutable cache
+      - aws s3 sync dist/ s3://$S3_BUCKET
+          --delete
+          --exclude "index.html"
+          --cache-control "public,max-age=31536000,immutable"
+      # index.html — never cached so users always get the latest entry point
+      - aws s3 cp dist/index.html s3://$S3_BUCKET/index.html
+          --cache-control "no-cache,no-store,must-revalidate"
+          --content-type "text/html"
+      - aws cloudfront create-invalidation
+          --distribution-id $CLOUDFRONT_DISTRIBUTION_ID
+          --paths "/*"
+          --query 'Invalidation.Id' --output text
+
+cache:
+  paths:
+    - team-notes-pro/frontend/node_modules/**/*

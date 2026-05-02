@@ -1,0 +1,64 @@
+version: 0.2
+# Backend buildspec — runs on every push to the configured branch.
+#
+# What it does:
+#   1. Authenticates Docker with ECR
+#   2. Builds the Docker image (multi-stage: frontend embed + backend)
+#   3. Tags with the short commit hash and :latest
+#   4. Pushes both tags to ECR
+#   5. Writes imagedefinitions.json so CodePipeline can update ECS
+#
+# Build-time env vars are read from SSM Parameter Store (non-secret config).
+# The VITE_* values are baked into the frontend bundle inside the Docker image.
+# The same values are used separately in buildspec-frontend.yml for the S3 deploy.
+
+env:
+  variables:
+    ECR_REPO_URI: "853696859325.dkr.ecr.us-east-1.amazonaws.com/team-notes-pro"
+    ECS_CONTAINER_NAME: "app"
+  parameter-store:
+    VITE_API_URL:               "/team-notes-pro/vite-api-url"
+    VITE_COGNITO_USER_POOL_ID:  "/team-notes-pro/cognito-user-pool-id"
+    VITE_COGNITO_CLIENT_ID:     "/team-notes-pro/cognito-client-id"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION
+          | docker login --username AWS --password-stdin $ECR_REPO_URI
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - IMAGE_TAG=${COMMIT_HASH:-latest}
+      - echo "Building image $ECR_REPO_URI:$IMAGE_TAG"
+
+  build:
+    commands:
+      - cd team-notes-pro
+      - docker build
+          --build-arg VITE_API_URL=$VITE_API_URL
+          --build-arg VITE_COGNITO_USER_POOL_ID=$VITE_COGNITO_USER_POOL_ID
+          --build-arg VITE_COGNITO_CLIENT_ID=$VITE_COGNITO_CLIENT_ID
+          -t $ECR_REPO_URI:$IMAGE_TAG
+          -t $ECR_REPO_URI:latest
+          .
+
+  post_build:
+    commands:
+      - docker push $ECR_REPO_URI:$IMAGE_TAG
+      - docker push $ECR_REPO_URI:latest
+      - echo "Writing imagedefinitions.json..."
+      - printf '[{"name":"%s","imageUri":"%s"}]'
+          $ECS_CONTAINER_NAME $ECR_REPO_URI:$IMAGE_TAG
+          > imagedefinitions.json
+      - cat imagedefinitions.json
+
+artifacts:
+  # imagedefinitions.json is the only artifact CodePipeline needs for the ECS deploy action
+  files:
+    - team-notes-pro/imagedefinitions.json
+  discard-paths: yes
+
+cache:
+  # Cache npm deps and Docker layers across builds to speed up subsequent runs
+  paths:
+    - /root/.npm/**/*
