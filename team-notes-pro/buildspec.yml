@@ -25,8 +25,8 @@ phases:
     commands:
       - docker push $ECR_REPO_URI:$IMAGE_TAG
       - docker push $ECR_REPO_URI:latest
-      - printf '[{"name":"%s","imageUri":"%s"}]' $ECS_CONTAINER_NAME $ECR_REPO_URI:$IMAGE_TAG > imagedefinitions.json
-      - cat imagedefinitions.json
+      - printf '[{"name":"%s","imageUri":"%s"}]' $ECS_CONTAINER_NAME $ECR_REPO_URI:$IMAGE_TAG > $CODEBUILD_SRC_DIR/imagedefinitions.json
+      - cat $CODEBUILD_SRC_DIR/imagedefinitions.json
 
 artifacts:
   files:
