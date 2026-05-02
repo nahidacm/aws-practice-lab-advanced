@@ -30,8 +30,8 @@ app.use(cors({
 
 app.use(express.json());
 
-// X-Ray: opens a segment per request (must come before routes)
-if (AWSXRay) app.use(AWSXRay.express.openSegment('team-notes-pro-api'));
+// X-Ray: aws-xray-sdk-core patches outgoing AWS SDK calls automatically.
+// Per-request HTTP segments require aws-xray-sdk-express (not installed here).
 
 // Request log — one structured line per response, queryable in Logs Insights
 app.use((req, res, next) => {
@@ -205,8 +205,6 @@ app.get('/api/exports/:id', requireAuth, wrap(async (req, res) => {
   res.json(result);
 }));
 
-// X-Ray: closes the segment (must come after all routes)
-if (AWSXRay) app.use(AWSXRay.express.closeSegment());
 
 // Serve React build for local dev only
 app.use(express.static(path.join(__dirname, 'public')));
