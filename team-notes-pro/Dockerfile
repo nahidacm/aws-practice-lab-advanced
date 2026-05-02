@@ -1,5 +1,5 @@
 # ── Stage 1: Build frontend ──────────────────────────────────────────────────
-FROM node:20-alpine AS frontend-builder
+FROM public.ecr.aws/docker/library/node:20-alpine AS frontend-builder
 WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -15,13 +15,13 @@ ENV VITE_COGNITO_CLIENT_ID=$VITE_COGNITO_CLIENT_ID
 RUN npm run build
 
 # ── Stage 2: Install backend prod deps ───────────────────────────────────────
-FROM node:20-alpine AS backend-builder
+FROM public.ecr.aws/docker/library/node:20-alpine AS backend-builder
 WORKDIR /backend
 COPY backend/package*.json ./
 RUN npm ci --omit=dev
 
 # ── Stage 3: Runtime image ────────────────────────────────────────────────────
-FROM node:20-alpine
+FROM public.ecr.aws/docker/library/node:20-alpine
 WORKDIR /app
 
 # Copy backend
